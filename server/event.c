@@ -39,6 +39,7 @@
 #include "security.h"
 
 #ifdef WINE_IOS
+#include "../../build/ntdll-unix/runtime_profiling.h"
 /* Madeira fastsync (include/wine/madeira_fastsync.h): the shared cell table
  * and its allocator live here; dlls/ntdll/unix/sync.c references the table
  * directly, since the server and every guest thread are one Mach task and
@@ -803,6 +804,7 @@ static void ios_evt_stat( struct event *event, int op, unsigned int status, unsi
 
 void ios_evt_record( void *obj, void *sync, int op, int state )
 {
+    if (!madeira_runtime_profiling_cached()) return;
     struct ios_evt_rec *r = &ios_evt_ring[ios_evt_pos];
 
     r->obj   = obj;

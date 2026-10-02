@@ -180,6 +180,7 @@ typedef struct
     LPWSTR path; /* path to url container directory */
     HANDLE mapping; /* handle of file mapping */
     DWORD file_size; /* size of file when mapping was opened */
+    urlcache_header *index_view; /* reused under the named container mutex */
     HANDLE mutex; /* handle of mutex */
     DWORD default_entry_type;
 } cache_container;
@@ -679,6 +680,8 @@ static DWORD cache_container_open_index(cache_container *container, DWORD blocks
  */
 static void cache_container_close_index(cache_container *pContainer)
 {
+    if (pContainer->index_view) UnmapViewOfFile(pContainer->index_view);
+    pContainer->index_view = NULL;
     CloseHandle(pContainer->mapping);
     pContainer->mapping = NULL;
 }
@@ -695,6 +698,7 @@ static BOOL cache_containers_add(const char *cache_prefix, LPCWSTR path,
     }
 
     pContainer->mapping = NULL;
+    pContainer->index_view = NULL;
     pContainer->file_size = 0;
     pContainer->default_entry_type = default_entry_type;
 
@@ -897,7 +901,9 @@ static urlcache_header* cache_container_lock_index(cache_container *pContainer)
     /* acquire mutex */
     WaitForSingleObject(pContainer->mutex, INFINITE);
 
-    pIndexData = MapViewOfFile(pContainer->mapping, FILE_MAP_WRITE, 0, 0, 0);
+    pIndexData = pContainer->index_view;
+    if (!pIndexData)
+        pIndexData = pContainer->index_view = MapViewOfFile(pContainer->mapping, FILE_MAP_WRITE, 0, 0, 0);
 
     if (!pIndexData)
     {
@@ -912,7 +918,6 @@ static urlcache_header* cache_container_lock_index(cache_container *pContainer)
      * of the memory mapped file */
     if (pHeader->size != pContainer->file_size)
     {
-        UnmapViewOfFile( pHeader );
         cache_container_close_index(pContainer);
         error = cache_container_open_index(pContainer, MIN_BLOCK_NO);
         if (error != ERROR_SUCCESS)
@@ -921,7 +926,7 @@ static urlcache_header* cache_container_lock_index(cache_container *pContainer)
             SetLastError(error);
             return NULL;
         }
-        pIndexData = MapViewOfFile(pContainer->mapping, FILE_MAP_WRITE, 0, 0, 0);
+        pIndexData = pContainer->index_view = MapViewOfFile(pContainer->mapping, FILE_MAP_WRITE, 0, 0, 0);
 
         if (!pIndexData)
         {
@@ -948,9 +953,13 @@ static urlcache_header* cache_container_lock_index(cache_container *pContainer)
  */
 static BOOL cache_container_unlock_index(cache_container *pContainer, urlcache_header *pHeader)
 {
-    /* release mutex */
+    /* The index is small, bounded by MAX_BLOCK_NO, and shared under the same
+     * named mutex. Repeated unmaps trigger context-wide FEX invalidation locks
+     * even for this data file. Keep one view until growth, reset or teardown. */
+    BOOL ret = TRUE;
+    if (pHeader != pContainer->index_view) ret = UnmapViewOfFile(pHeader);
     ReleaseMutex(pContainer->mutex);
-    return UnmapViewOfFile(pHeader);
+    return ret;
 }
 
 /***********************************************************************
@@ -1164,41 +1173,101 @@ static BOOL urlcache_clean_leaked_entries(cache_container *container, urlcache_h
  *     ERROR_SUCCESS when new memory is available
  *     error code otherwise
  */
+/* Explicit WriteFile is required for Madeira's writable shadow mappings:
+ * msync/closing the mapping alone does not persist their contents. Called only
+ * during index growth, never on each lookup or frame. */
+static DWORD cache_index_write(HANDLE file, const void *data, DWORD size)
+{
+    const BYTE *bytes = data;
+    DWORD offset = 0, written;
+    if (SetFilePointer(file, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER)
+        return GetLastError();
+    while (offset < size)
+    {
+        if (!WriteFile(file, bytes + offset, size - offset, &written, NULL)) return GetLastError();
+        if (!written) return ERROR_WRITE_FAULT;
+        offset += written;
+    }
+    return ERROR_SUCCESS;
+}
+
 static DWORD cache_container_clean_index(cache_container *container, urlcache_header **file_view)
 {
-    urlcache_header *header = *file_view;
-    DWORD ret;
+    urlcache_header *old = *file_view, *grown = NULL;
+    HANDLE file, mapping = NULL, previous_mapping;
+    WCHAR path[MAX_PATH];
+    BYTE *snapshot;
+    DWORD old_size, blocks, size, error, rollback;
 
-    TRACE("(%s %s)\n", debugstr_a(container->cache_prefix), debugstr_w(container->path));
-
-    if(urlcache_clean_leaked_entries(container, header))
-        return ERROR_SUCCESS;
-
-    /* iOS: growing the index below (close_index + reopen at double capacity) can never
-     * work — mapped-file writes are silently lost (iOS mmap PROT_WRITE downgrade), so the
-     * reopen reads stale bytes, the reinitialized index is empty at minimum capacity, the
-     * entry still doesn't fit, and the caller's ERROR_HANDLE_DISK_FULL loop cycles forever
-     * (ml342: 3,136 iterations). Report the cache as full instead: both callers break out
-     * of their retry loop on this and fail the single entry gracefully. */
-    ERR("[cache-full] rev=ml342 refusing index growth (iOS: reopen cannot preserve content) — entry will not be cached\n");
-    return ERROR_NOT_ENOUGH_MEMORY;
-
-    if(header->size >= ALLOCATION_TABLE_SIZE*8*BLOCKSIZE + ENTRY_START_OFFSET) {
-        WARN("index file has maximal size\n");
-        return ERROR_NOT_ENOUGH_MEMORY;
+    if (urlcache_clean_leaked_entries(container, old)) return ERROR_SUCCESS;
+    old_size = old->size;
+    blocks = old->capacity_in_blocks;
+    if (blocks < MIN_BLOCK_NO || blocks > MAX_BLOCK_NO || old_size != FILE_SIZE(blocks) ||
+        old_size != container->file_size) return ERROR_INVALID_DATA;
+    if (blocks == MAX_BLOCK_NO) return ERROR_NOT_ENOUGH_MEMORY;
+    blocks = min(blocks * 2, MAX_BLOCK_NO);
+    size = FILE_SIZE(blocks);
+    snapshot = malloc(old_size);
+    if (!snapshot) return ERROR_NOT_ENOUGH_MEMORY;
+    memcpy(snapshot, old, old_size);
+    lstrcpyW(path, container->path);
+    lstrcatW(path, L"index.dat");
+    file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        error = GetLastError();
+        free(snapshot);
+        return error;
     }
 
-    cache_container_close_index(container);
-    ret = cache_container_open_index(container, header->capacity_in_blocks*2);
-    if(ret != ERROR_SUCCESS)
-        return ret;
-    header = MapViewOfFile(container->mapping, FILE_MAP_WRITE, 0, 0, 0);
-    if(!header)
-        return GetLastError();
+    error = cache_index_write(file, snapshot, old_size);
+    if (error) goto failed;
+    if (SetFilePointer(file, size, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER || !SetEndOfFile(file))
+    {
+        error = GetLastError();
+        goto failed;
+    }
+    mapping = cache_container_map_index(file, container->path, size, NULL);
+    if (!mapping) { error = GetLastError(); goto failed; }
+    grown = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
+    if (!grown) { error = GetLastError(); goto failed; }
+    memcpy(grown, snapshot, old_size);
+    memset((BYTE *)grown + old_size, 0, size - old_size);
+    grown->size = size;
+    grown->capacity_in_blocks = blocks;
+    error = cache_index_write(file, grown, size);
+    if (error) goto failed;
 
-    UnmapViewOfFile(*file_view);
-    *file_view = header;
+    /* Publish only after a complete, persisted index exists. Old views in
+     * another container instance see the size mismatch at their next lock.
+     * No lookup can race this swap: the existing named mutex is held. */
+    old->size = size;
+    previous_mapping = container->mapping;
+    container->mapping = mapping;
+    container->file_size = size;
+    container->index_view = grown;
+    *file_view = grown;
+    UnmapViewOfFile(old);
+    CloseHandle(previous_mapping);
+    CloseHandle(file);
+    free(snapshot);
+    WARN("[wininet-index] grew %lu -> %lu bytes; entries preserved, view reused\n", old_size, size);
     return ERROR_SUCCESS;
+
+failed:
+    if (grown) UnmapViewOfFile(grown);
+    if (mapping) CloseHandle(mapping);
+    /* Preserve the live old view and all cached entries on every failure,
+     * including a partial WriteFile. Restore disk too when the OS permits it. */
+    memcpy(old, snapshot, old_size);
+    rollback = cache_index_write(file, snapshot, old_size);
+    if (!rollback && (SetFilePointer(file, old_size, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER ||
+                      !SetEndOfFile(file))) rollback = GetLastError();
+    if (rollback) WARN("[wininet-index] rollback write failed %lu; live old index retained\n", rollback);
+    CloseHandle(file);
+    free(snapshot);
+    return error;
 }
 
 /* Just like DosDateTimeToFileTime, except that it also maps the special
@@ -3829,6 +3898,7 @@ BOOL WINAPI GetUrlCacheConfigInfoW(LPINTERNET_CACHE_CONFIG_INFOW info, LPDWORD s
         return FALSE;
     }
 
+    WaitForSingleObject(container->mutex, INFINITE);
     info->dwContainer = 0;
     info->dwQuota = FILE_SIZE(MAX_BLOCK_NO) / 1024;
     info->dwReserved4 = 0;
@@ -3841,6 +3911,7 @@ BOOL WINAPI GetUrlCacheConfigInfoW(LPINTERNET_CACHE_CONFIG_INFOW info, LPDWORD s
     lstrcpynW(info->CachePath, container->path, MAX_PATH);
 
     cache_container_close_index(container);
+    ReleaseMutex(container->mutex);
 
     TRACE("CachePath %s\n", debugstr_w(info->CachePath));
 
