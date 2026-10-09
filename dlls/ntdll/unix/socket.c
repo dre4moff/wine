@@ -488,6 +488,11 @@ static int convert_control_headers(struct msghdr *hdr, WSABUF *control)
 #endif /* IP_PKTINFO */
 
 #if defined(IP_TOS)
+#if defined(IP_RECVTOS) && IP_RECVTOS != IP_TOS
+                    /* Darwin/BSD return the receive option as the message type,
+                     * while Linux returns IP_TOS. Winsock expects IP_TOS. */
+                    case IP_RECVTOS:
+#endif
                     case IP_TOS:
                     {
                         INT tos = *(unsigned char *)CMSG_DATA(cmsg_unix);
@@ -598,25 +603,32 @@ static int wow64_translate_control( const WSABUF *control64, struct afd_wsabuf_3
     {
         struct cmsghdr_32 *cmsg32 = (struct cmsghdr_32 *)ptr32;
         const WSACMSGHDR *cmsg64 = (const WSACMSGHDR *)ptr64;
+        size_t remaining = control64->buf + control64->len - ptr64;
+        size_t payload, message_size;
 
-        if (ptr32 + sizeof(*cmsg32) + cmsg_align_32( cmsg64->cmsg_len ) > buf32 + max_len)
-        {
-            control32->len = 0;
-            return 0;
-        }
+        if (remaining < sizeof(*cmsg64) || cmsg64->cmsg_len < sizeof(*cmsg64) ||
+            cmsg64->cmsg_len > remaining || WSA_CMSG_ALIGN( cmsg64->cmsg_len ) > remaining)
+            goto error;
+        payload = cmsg64->cmsg_len - sizeof(*cmsg64);
+        message_size = sizeof(*cmsg32) + payload;
+        if (cmsg_align_32( message_size ) > max_len - (size_t)(ptr32 - buf32)) goto error;
 
-        cmsg32->cmsg_len = cmsg64->cmsg_len - sizeof(*cmsg64) + sizeof(*cmsg32);
+        cmsg32->cmsg_len = message_size;
         cmsg32->cmsg_level = cmsg64->cmsg_level;
         cmsg32->cmsg_type = cmsg64->cmsg_type;
-        memcpy( cmsg32 + 1, cmsg64 + 1, cmsg64->cmsg_len );
+        memcpy( cmsg32 + 1, cmsg64 + 1, payload );
 
         ptr64 += WSA_CMSG_ALIGN( cmsg64->cmsg_len );
         ptr32 += cmsg_align_32( cmsg32->cmsg_len );
     }
 
     control32->len = ptr32 - buf32;
-    FIXME("-> %d\n", control32->len);
+    TRACE("-> %d\n", control32->len);
     return 1;
+
+error:
+    control32->len = 0;
+    return 0;
 }
 
 struct ip_hdr
